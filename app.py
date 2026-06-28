@@ -1,31 +1,10 @@
-import os
 import streamlit as st
 import pandas as pd
 import requests
 
 st.set_page_config(page_title="에듀테크 수강생 관리 대시보드", layout="wide", page_icon="📊")
 
-# ── 1. 데이터 전처리 & 머지 ──────────────────────────────────────────────
-MERGED_PATH = "merged_sales.xlsx"
-
-def build_merged():
-    df_s = pd.read_excel("더미데이터/edutech_학습자이용데이터.xlsx")
-    df_v = pd.read_excel("더미데이터/edutech_VOC문의데이터.xlsx")
-    df_s.columns = df_s.columns.str.strip()
-    df_v.columns = df_v.columns.str.strip()
-    # 두 파일을 user_id 기준 left join으로 통합
-    merged = df_s.merge(df_v.drop(columns=["이름"]), on="user_id", how="left")
-    merged.to_excel(MERGED_PATH, index=False)
-
-if not os.path.exists(MERGED_PATH):
-    build_merged()
-
-@st.cache_data
-def load_merged():
-    return pd.read_excel(MERGED_PATH)
-
-df_all = load_merged()
-
+# ── 컬럼 정의 ─────────────────────────────────────────────────────────────
 STUDENT_COLS = [
     "user_id", "이름", "수강과정", "수강유형", "가입일", "거주지역", "주이용기기",
     "전체커리큘럼수", "완료커리큘럼수", "출석률", "과제제출률", "평균퀴즈점수",
@@ -36,17 +15,46 @@ VOC_COLS = [
     "문의내용요약", "처리담당자", "처리상태", "처리소요시간(h)", "만족도(1~5)"
 ]
 
-df_students = df_all[STUDENT_COLS].drop_duplicates(subset="user_id").reset_index(drop=True)
-_voc_raw = df_all.dropna(subset=["ticket_id"])[
-    [c for c in VOC_COLS if c != "이름"]
-].reset_index(drop=True)
-_voc_raw = _voc_raw.merge(df_students[["user_id", "이름"]], on="user_id", how="left")
-df_voc_base = _voc_raw[VOC_COLS].reset_index(drop=True)
+# ── 데이터 뷰 재구성 ────────────────────────────────────────────────────
+def rebuild_views():
+    df_s = st.session_state.raw_students.copy()
+    df_v = st.session_state.raw_voc.copy()
+    df_s.columns = df_s.columns.str.strip()
+    df_v.columns = df_v.columns.str.strip()
 
-if "voc_df" not in st.session_state:
-    st.session_state.voc_df = df_voc_base.copy()
+    merged = df_s.merge(df_v.drop(columns=["이름"], errors="ignore"), on="user_id", how="left")
 
-# ── 2. 외부 API: 오늘의 명언 ────────────────────────────────────────────
+    # merged_sales.xlsx 저장 (가능한 경우)
+    try:
+        merged.to_excel("merged_sales.xlsx", index=False)
+    except Exception:
+        pass
+
+    avail_s = [c for c in STUDENT_COLS if c in merged.columns]
+    df_students = merged[avail_s].drop_duplicates(subset="user_id").reset_index(drop=True)
+
+    avail_v = [c for c in VOC_COLS if c != "이름" and c in merged.columns]
+    _voc = merged.dropna(subset=["ticket_id"])[avail_v].reset_index(drop=True)
+    _voc = _voc.merge(df_students[["user_id", "이름"]], on="user_id", how="left")
+    avail_voc = [c for c in VOC_COLS if c in _voc.columns]
+    df_voc = _voc[avail_voc].reset_index(drop=True)
+
+    st.session_state.df_students = df_students
+    st.session_state.voc_df = df_voc
+
+# ── 초기 데이터 로드 ────────────────────────────────────────────────────
+if "raw_students" not in st.session_state:
+    df_s = pd.read_excel("더미데이터/edutech_학습자이용데이터.xlsx")
+    df_v = pd.read_excel("더미데이터/edutech_VOC문의데이터.xlsx")
+    df_s.columns = df_s.columns.str.strip()
+    df_v.columns = df_v.columns.str.strip()
+    st.session_state.raw_students = df_s
+    st.session_state.raw_voc = df_v
+    rebuild_views()
+
+df_students = st.session_state.df_students
+
+# ── 외부 API: 오늘의 명언 ────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_quote():
     try:
@@ -73,7 +81,6 @@ def sort_voc(df):
 # ── 타이틀 & 명언 ────────────────────────────────────────────────────────
 st.title("📊 에듀테크 수강생 관리 대시보드")
 
-quote = get_quote()
 st.markdown(
     f"""
     <div style="
@@ -84,7 +91,7 @@ st.markdown(
         margin: 8px 0 16px 0;
     ">
         <span style="font-size: 1.05rem; color: #e8f4fd; font-style: italic; line-height: 1.6;">
-            💬 {quote}
+            💬 {get_quote()}
         </span>
     </div>
     """,
@@ -92,17 +99,17 @@ st.markdown(
 )
 st.divider()
 
-# ── 3. KPI 지표 ──────────────────────────────────────────────────────────
+# ── KPI 지표 ─────────────────────────────────────────────────────────────
 total = len(df_students)
 completion_rate = (
     df_students["완료커리큘럼수"] >= df_students["전체커리큘럼수"]
-).mean() * 100
-avg_attend = df_students["출석률"].mean() * 100
-churn_rate = (df_students["이탈여부"] == "Y").mean() * 100
+).mean() * 100 if "완료커리큘럼수" in df_students.columns else 0
+avg_attend = df_students["출석률"].mean() * 100 if "출석률" in df_students.columns else 0
+churn_rate = (df_students["이탈여부"] == "Y").mean() * 100 if "이탈여부" in df_students.columns else 0
 
-cnt_gov = int((df_students["수강유형"] == "국비지원").sum())
-cnt_job = int((df_students["수강유형"] == "취업연계형").sum())
-cnt_gen = int((df_students["수강유형"] == "일반결제형").sum())
+cnt_gov = int((df_students["수강유형"] == "국비지원").sum()) if "수강유형" in df_students.columns else 0
+cnt_job = int((df_students["수강유형"] == "취업연계형").sum()) if "수강유형" in df_students.columns else 0
+cnt_gen = int((df_students["수강유형"] == "일반결제형").sum()) if "수강유형" in df_students.columns else 0
 
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 with kpi1:
@@ -117,19 +124,44 @@ with kpi4:
 
 st.divider()
 
-# ── 4. 메인 레이아웃: 좌(수강생) / 우(VOC) ──────────────────────────────
+# ── 메인 레이아웃 ─────────────────────────────────────────────────────────
 left, right = st.columns([1, 1.3], gap="large")
 
-# ── 좌측: 수강생 필터 & 목록 ─────────────────────────────────────────────
+# ── 좌측: 수강생 목록 ─────────────────────────────────────────────────────
 with left:
     st.subheader("수강생 목록")
 
+    # 수강생 데이터 업로드
+    with st.expander("📂 수강생 데이터 교체"):
+        st.caption("현재 수강생 데이터를 새 엑셀 파일로 교체합니다.")
+        up_s = st.file_uploader(
+            "수강생 엑셀 파일 (.xlsx)",
+            type=["xlsx", "xls"],
+            key="up_student",
+        )
+        if up_s:
+            try:
+                df_new_s = pd.read_excel(up_s)
+                df_new_s.columns = df_new_s.columns.str.strip()
+                required_s = {"user_id", "이름", "수강과정", "수강유형", "출석률", "이탈여부"}
+                missing_s = required_s - set(df_new_s.columns)
+                if missing_s:
+                    st.error(f"필수 컬럼 누락: {', '.join(missing_s)}")
+                else:
+                    st.session_state.raw_students = df_new_s
+                    rebuild_views()
+                    st.success(f"수강생 데이터 업데이트 완료! ({len(df_new_s)}명)")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"파일 오류: {e}")
+
+    # 필터
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        courses = ["전체"] + sorted(df_students["수강과정"].unique())
+        courses = ["전체"] + sorted(df_students["수강과정"].unique()) if "수강과정" in df_students.columns else ["전체"]
         sel_course = st.selectbox("과정", courses)
     with fc2:
-        types = ["전체"] + sorted(df_students["수강유형"].unique())
+        types = ["전체"] + sorted(df_students["수강유형"].unique()) if "수강유형" in df_students.columns else ["전체"]
         sel_type = st.selectbox("수강유형", types)
     with fc3:
         sel_status = st.selectbox("이탈여부", ["전체", "Y (이탈)", "N (정상)"])
@@ -145,25 +177,47 @@ with left:
         filtered = filtered[filtered["이탈여부"] == "N"]
 
     display_df = filtered[["user_id", "이름", "수강과정", "수강유형", "출석률", "이탈여부"]].copy()
-    display_df["출석률"] = (display_df["출석률"] * 100).round(1).astype(str) + "%"
+    if "출석률" in display_df.columns:
+        display_df["출석률"] = (display_df["출석률"] * 100).round(1).astype(str) + "%"
     st.caption("행을 클릭하면 우측 VOC 대시보드에 반영됩니다.")
     selection = st.dataframe(
         display_df.reset_index(drop=True),
         use_container_width=True,
-        height=380,
+        height=340,
         on_select="rerun",
         selection_mode="single-row",
         key="student_table",
     )
     selected_rows = selection.selection.rows
-    if selected_rows:
-        sel_name = filtered.iloc[selected_rows[0]]["이름"]
-    else:
-        sel_name = None
+    sel_name = filtered.iloc[selected_rows[0]]["이름"] if selected_rows else None
 
 # ── 우측: VOC 대시보드 ────────────────────────────────────────────────────
 with right:
     st.subheader("VOC 대시보드")
+
+    # VOC 데이터 업로드
+    with st.expander("📂 VOC 데이터 교체"):
+        st.caption("현재 VOC 데이터를 새 엑셀 파일로 교체합니다.")
+        up_v = st.file_uploader(
+            "VOC 엑셀 파일 (.xlsx)",
+            type=["xlsx", "xls"],
+            key="up_voc",
+        )
+        if up_v:
+            try:
+                df_new_v = pd.read_excel(up_v)
+                df_new_v.columns = df_new_v.columns.str.strip()
+                required_v = {"ticket_id", "user_id", "처리상태", "만족도(1~5)"}
+                missing_v = required_v - set(df_new_v.columns)
+                if missing_v:
+                    st.error(f"필수 컬럼 누락: {', '.join(missing_v)}")
+                else:
+                    st.session_state.raw_voc = df_new_v
+                    rebuild_views()
+                    st.success(f"VOC 데이터 업데이트 완료! ({len(df_new_v)}건)")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"파일 오류: {e}")
 
     # 인수인계 규칙 가이드
     with st.expander("❕ 인수인계 규칙 가이드"):
@@ -177,8 +231,7 @@ with right:
     # 전체 보기 토글
     if "show_all" not in st.session_state:
         st.session_state.show_all = False
-
-    if st.button("📋 전체 VOC 보기", use_container_width=False):
+    if st.button("📋 전체 VOC 보기"):
         st.session_state.show_all = not st.session_state.show_all
 
     voc_df = st.session_state.voc_df
